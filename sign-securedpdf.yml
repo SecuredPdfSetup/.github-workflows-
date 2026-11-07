@@ -1,1 +1,285 @@
-hshhdhdhd
+
+name: SecurePdf Installer Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing draft release tag"
+        required: true
+        type: string
+      release_name:
+        description: "Published GitHub release title"
+        required: true
+        type: string
+
+jobs:
+  sign-and-publish:
+    name: Sign and Publish SecurePdf Installer
+    runs-on: windows-latest
+
+    environment: securedpdf-signing
+
+    permissions:
+      contents: write
+
+    env:
+      GH_TOKEN: ${{ github.token }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download and validate draft release
+        shell: pwsh
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $tag = $env:RELEASE_TAG.Trim()
+
+          if ([string]::IsNullOrWhiteSpace($tag)) {
+              throw "Release tag cannot be empty."
+          }
+
+          $draft = gh release view "$tag" --json isDraft --jq ".isDraft"
+
+          if ($LASTEXITCODE -ne 0) {
+              throw "Unable to locate the requested GitHub release."
+          }
+
+          if ($draft.Trim() -ne "true") {
+              throw "The specified release must be a draft."
+          }
+
+          $downloadDir = Join-Path $env:RUNNER_TEMP "securepdf-release"
+
+          New-Item -ItemType Directory -Path $downloadDir -Force | Out-Null
+
+          gh release download "$tag" `
+              --pattern "Installer.exe" `
+              --dir "$downloadDir"
+
+          if ($LASTEXITCODE -ne 0) {
+              throw "Unable to download Installer.exe from the draft release."
+          }
+
+          $installer = Join-Path $downloadDir "Installer.exe"
+
+          if (!(Test-Path -LiteralPath $installer)) {
+              throw "Installer.exe was not found in the downloaded release."
+          }
+
+          "SECUREPDF_RELEASE_TAG=$tag" >> $env:GITHUB_ENV
+          "SECUREPDF_RELEASE_DIR=$downloadDir" >> $env:GITHUB_ENV
+          "SECUREPDF_INSTALLER=$installer" >> $env:GITHUB_ENV
+
+      - name: Reconstruct signing certificate
+        shell: pwsh
+        env:
+          PFX_BASE64: ${{ secrets.SECUREPDF_PFX_BASE64 }}
+          PFX_PASSWORD: ${{ secrets.SECUREPDF_CERT_PASSWORD }}
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          if ([string]::IsNullOrWhiteSpace($env:PFX_BASE64)) {
+              throw "SECUREPDF_PFX_BASE64 is missing."
+          }
+
+          if ([string]::IsNullOrWhiteSpace($env:PFX_PASSWORD)) {
+              throw "SECUREPDF_CERT_PASSWORD is missing."
+          }
+
+          $pfxPath = Join-Path $env:RUNNER_TEMP "securepdf_signing.pfx"
+
+          $bytes = [Convert]::FromBase64String($env:PFX_BASE64)
+
+          [IO.File]::WriteAllBytes($pfxPath, $bytes)
+
+          if (!(Test-Path -LiteralPath $pfxPath)) {
+              throw "Failed to reconstruct the signing certificate."
+          }
+
+          "SECUREPDF_PFX_PATH=$pfxPath" >> $env:GITHUB_ENV
+
+      - name: Locate Windows SDK SignTool
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $kitsRoot = Join-Path ${env:ProgramFiles(x86)} "Windows Kits\10\bin"
+
+          if (!(Test-Path -LiteralPath $kitsRoot)) {
+              throw "Windows SDK installation directory was not found."
+          }
+
+          $signtool = Get-ChildItem `
+              -Path $kitsRoot `
+              -Filter "signtool.exe" `
+              -File `
+              -Recurse |
+              Where-Object {
+                  $_.FullName -match '\\x64\\signtool\.exe$'
+              } |
+              Sort-Object {
+                  try {
+                      [version]$_.Directory.Parent.Name
+                  }
+                  catch {
+                      [version]"0.0"
+                  }
+              } -Descending |
+              Select-Object -First 1
+
+          if (!$signtool) {
+              throw "64-bit Windows SDK SignTool was not found."
+          }
+
+          Write-Host "Using SignTool: $($signtool.FullName)"
+
+          "SECUREPDF_SIGNTOOL=$($signtool.FullName)" >> $env:GITHUB_ENV
+
+      - name: Sign installer
+        shell: pwsh
+        env:
+          PFX_PASSWORD: ${{ secrets.SECUREPDF_CERT_PASSWORD }}
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $signtool = $env:SECUREPDF_SIGNTOOL
+          $pfx = $env:SECUREPDF_PFX_PATH
+          $installer = $env:SECUREPDF_INSTALLER
+
+          & $signtool sign `
+              /fd SHA256 `
+              /td SHA256 `
+              /tr "http://timestamp.digicert.com" `
+              /f "$pfx" `
+              /p "$env:PFX_PASSWORD" `
+              /d "SecurePdf Installer" `
+              "$installer"
+
+          if ($LASTEXITCODE -ne 0) {
+              throw "Authenticode signing failed."
+          }
+
+      - name: Verify digital signature and certificate
+        shell: pwsh
+        env:
+          EXPECTED_THUMBPRINT: ${{ secrets.SECUREPDF_CERT_THUMBPRINT }}
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $signtool = $env:SECUREPDF_SIGNTOOL
+          $installer = $env:SECUREPDF_INSTALLER
+
+          & $signtool verify /pa "$installer"
+
+          if ($LASTEXITCODE -ne 0) {
+              throw "SignTool signature verification failed."
+          }
+
+          $signature = Get-AuthenticodeSignature -FilePath $installer
+
+          if ($signature.Status -ne "Valid") {
+              throw "Installer signature status is not Valid: $($signature.Status)"
+          }
+
+          if (!$signature.SignerCertificate) {
+              throw "Signed installer does not contain a signer certificate."
+          }
+
+          $actualThumbprint = $signature.SignerCertificate.Thumbprint.Trim().ToUpperInvariant()
+          $expectedThumbprint = $env:EXPECTED_THUMBPRINT.Trim().ToUpperInvariant()
+
+          if ($actualThumbprint -ne $expectedThumbprint) {
+              throw "Certificate thumbprint mismatch. Actual: $actualThumbprint"
+          }
+
+          Write-Host "SecurePdf signature successfully verified." -ForegroundColor Green
+          Write-Host "Certificate thumbprint: $actualThumbprint"
+
+      - name: Generate SHA256 checksum
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $installer = $env:SECUREPDF_INSTALLER
+          $checksumFile = "$installer.sha256"
+
+          $hash = (Get-FileHash -LiteralPath $installer -Algorithm SHA256).Hash
+
+          "$hash  Installer.exe" |
+              Set-Content -LiteralPath $checksumFile -Encoding ASCII
+
+          Write-Host "SHA256: $hash"
+
+          "SECUREPDF_CHECKSUM=$checksumFile" >> $env:GITHUB_ENV
+
+      - name: Replace release assets
+        shell: pwsh
+        env:
+          RELEASE_NAME: ${{ inputs.release_name }}
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $tag = $env:SECUREPDF_RELEASE_TAG
+
+          $release = gh release view "$tag" --json assets | ConvertFrom-Json
+
+          if ($LASTEXITCODE -ne 0) {
+              throw "Unable to inspect existing release assets."
+          }
+
+          $assetsToReplace = @(
+              "Installer.exe",
+              "Installer.exe.sha256"
+          )
+
+          foreach ($asset in $release.assets) {
+              if ($assetsToReplace -contains $asset.name) {
+                  Write-Host "Removing previous asset: $($asset.name)"
+
+                  gh release delete-asset "$tag" "$($asset.name)" --yes
+
+                  if ($LASTEXITCODE -ne 0) {
+                      throw "Failed to remove existing asset: $($asset.name)"
+                  }
+              }
+          }
+
+          gh release upload "$tag" `
+              "$env:SECUREPDF_INSTALLER" `
+              "$env:SECUREPDF_CHECKSUM"
+
+          if ($LASTEXITCODE -ne 0) {
+              throw "Failed to upload signed installer and checksum."
+          }
+
+          gh release edit "$tag" `
+              --title "$env:RELEASE_NAME" `
+              --draft=false
+
+          if ($LASTEXITCODE -ne 0) {
+              throw "Failed to publish the signed GitHub release."
+          }
+
+          Write-Host "SecurePdf release successfully published." -ForegroundColor Green
+
+      - name: Clean up temporary signing certificate
+        if: always()
+        shell: pwsh
+        run: |
+          $pfxPath = Join-Path $env:RUNNER_TEMP "securepdf_signing.pfx"
+
+          if (Test-Path -LiteralPath $pfxPath) {
+              Remove-Item -LiteralPath $pfxPath -Force
+              Write-Host "Temporary signing certificate removed."
+          }
+
+          $downloadDir = Join-Path $env:RUNNER_TEMP "securepdf-release"
+
+          if (Test-Path -LiteralPath $downloadDir) {
+              Remove-Item -LiteralPath $downloadDir -Recurse -Force
+          }
